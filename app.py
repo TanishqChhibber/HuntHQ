@@ -1,16 +1,14 @@
 from flask import Flask, render_template, request, jsonify, send_file
 import os
-import json
 import pandas as pd
 from datetime import datetime
 import threading
 import uuid
-import sys
 import traceback
 
 app = Flask(__name__)
 
-# Store scraping results temporarily
+# In‑memory stores (simple prototype; not for production concurrency)
 scraping_results = {}
 scraping_status = {}
 
@@ -20,147 +18,75 @@ def index():
 
 @app.route('/api/scrape', methods=['POST'])
 def start_scraping():
-    data = request.get_json()
+    data = request.get_json() or {}
     company = data.get('company', '').lower().strip()
-    
-    if not company:
-        return jsonify({'error': 'Company name is required'}), 400
-    
-    if company not in ['swiggy']:
-        return jsonify({'error': f'Scraper for "{company}" not available yet. Currently supported: swiggy'}), 400
-    
-    # Generate unique task ID
+    allowed = {'swiggy', 'wipro'}
+    if company not in allowed:
+        return jsonify({'error': f'Only supported: {", ".join(sorted(allowed))}'}), 400
+
     task_id = str(uuid.uuid4())
-    scraping_status[task_id] = {'status': 'running', 'progress': 0, 'message': 'Starting scraper...'}
-    
-    # Start scraping in background thread
-    thread = threading.Thread(target=run_scraper, args=(company, task_id))
-    thread.daemon = True
+    scraping_status[task_id] = {'status': 'running', 'progress': 0, 'message': 'Queued', 'company': company}
+
+    thread = threading.Thread(target=run_scraper, args=(company, task_id), daemon=True)
     thread.start()
-    
     return jsonify({'task_id': task_id, 'status': 'started'})
 
 @app.route('/api/status/<task_id>')
 def get_status(task_id):
-    if task_id not in scraping_status:
+    status = scraping_status.get(task_id)
+    if not status:
         return jsonify({'error': 'Task not found'}), 404
-    
-    status = scraping_status[task_id]
-    if status['status'] == 'completed' and task_id in scraping_results:
-        status['results'] = scraping_results[task_id]
-    
+    if status['status'] == 'completed':
+        status = {**status, 'results': scraping_results.get(task_id, [])}
     return jsonify(status)
-
-@app.route('/api/test-jobs')
-def test_jobs():
-    """Test endpoint to check if job data is being read correctly"""
-    try:
-        csv_path = 'data/swiggy_jobs.csv'
-        if os.path.exists(csv_path):
-            df = pd.read_csv(csv_path)
-            results = df.to_dict('records')
-            return jsonify({
-                'status': 'success',
-                'count': len(results),
-                'jobs': results
-            })
-        else:
-            return jsonify({'error': 'No job data found'}), 404
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/download/<task_id>')
 def download_csv(task_id):
     if task_id not in scraping_results:
-        return jsonify({'error': 'No results found for this task'}), 404
-    
-    results = scraping_results[task_id]
-    if not results:
-        return jsonify({'error': 'No jobs found to download'}), 404
-    
-    # Create DataFrame and save to CSV
-    df = pd.DataFrame(results)
-    csv_filename = f"jobs_{task_id}.csv"
-    csv_path = os.path.join('data', csv_filename)
-    
+        return jsonify({'error': 'No results for this task'}), 404
+    rows = scraping_results[task_id]
+    if not rows:
+        return jsonify({'error': 'No data to download'}), 404
     if not os.path.exists('data'):
         os.makedirs('data')
-    
-    df.to_csv(csv_path, index=False)
-    
+    csv_path = os.path.join('data', f'jobs_{task_id}.csv')
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
     return send_file(csv_path, as_attachment=True, download_name=f"jobs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
 
-def run_scraper(company, task_id):
+
+def run_scraper(company: str, task_id: str):
     try:
-        scraping_status[task_id]['message'] = 'Initializing scraper...'
-        scraping_status[task_id]['progress'] = 10
-        
+        scraping_status[task_id].update(message='Initializing...', progress=5)
         if company == 'swiggy':
-            scraping_status[task_id]['message'] = 'Scraping Swiggy jobs...'
-            scraping_status[task_id]['progress'] = 30
-            
-            # Import the scraper functions
-            try:
-                from swiggy_scraper import scrape_swiggy_selenium, scrape_swiggy
-                
-                # Try Selenium scraping first
-                success = scrape_swiggy_selenium()
-                
-                # If Selenium fails, try traditional scraping
-                if not success:
-                    scraping_status[task_id]['message'] = 'Trying traditional scraping...'
-                    scraping_status[task_id]['progress'] = 60
-                    scrape_swiggy()
-                    
-            except ImportError as e:
-                scraping_status[task_id]['message'] = 'Scraper modules not found, using basic scraping...'
-                scraping_status[task_id]['progress'] = 50
-                # Create a basic entry if scraper is not available
-                if not os.path.exists("data"):
-                    os.makedirs("data")
-                
-                sample_data = [{
-                    "Timestamp": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                    "job_id": 1,
-                    "Role": f"Sample Job for {company.title()}",
-                    "Company": company.title(),
-                    "Logo": f"https://careers.{company}.com/favicon.ico",
-                    "Location": "Multiple Cities",
-                    "Experience": "Not specified",
-                    "Salary": "Not disclosed",
-                    "Job Link": f"https://careers.{company}.com/#/careers",
-                    "Posted By (LinkedIn URL)": "",
-                    "Employment Type": "Full-time",
-                    "Scout": "No",
-                    "Skills": "Check website for details"
-                }]
-                
-                df = pd.DataFrame(sample_data)
-                df.to_csv(f"data/{company}_jobs.csv", index=False)
-            
-            scraping_status[task_id]['progress'] = 80
-            scraping_status[task_id]['message'] = 'Processing results...'
-            
-            # Read the results from CSV if available
-            csv_path = f'data/{company}_jobs.csv'
-            if os.path.exists(csv_path):
-                df = pd.read_csv(csv_path)
-                results = df.to_dict('records')
-                scraping_results[task_id] = results
-                
-                scraping_status[task_id]['status'] = 'completed'
-                scraping_status[task_id]['progress'] = 100
-                scraping_status[task_id]['message'] = f'Successfully scraped {len(results)} jobs!'
-            else:
-                scraping_status[task_id]['status'] = 'completed'
-                scraping_status[task_id]['progress'] = 100
-                scraping_status[task_id]['message'] = 'No jobs found or scraping failed'
-                scraping_results[task_id] = []
-        
+            from swiggy_scraper import scrape_swiggy as runner
+        elif company == 'wipro':
+            from wipro_scraper import scrape_wipro as runner
+        else:
+            scraping_status[task_id].update(status='error', message='Unsupported company')
+            return
+
+        scraping_status[task_id].update(message='Launching browser...', progress=15)
+        success = runner(progress_callback=lambda p, m: _update_progress(task_id, p, m))
+
+        scraping_status[task_id].update(message='Reading results...', progress=90)
+        csv_path = f'data/{company}_jobs.csv'
+        if success and os.path.exists(csv_path):
+            df = pd.read_csv(csv_path)
+            scraping_results[task_id] = df.to_dict('records')
+            scraping_status[task_id].update(status='completed', progress=100, message=f'Successfully scraped {len(df)} jobs')
+        else:
+            scraping_results[task_id] = []
+            scraping_status[task_id].update(status='completed', progress=100, message='No jobs found')
     except Exception as e:
-        scraping_status[task_id]['status'] = 'error'
-        scraping_status[task_id]['message'] = f'Error: {str(e)}'
-        print(f"Scraping error: {traceback.format_exc()}")
+        scraping_results[task_id] = []
+        scraping_status[task_id].update(status='error', message=f'Error: {e}')
+        print('Scraping error:', traceback.format_exc())
+
+def _update_progress(task_id: str, percent: int, message: str):
+    st = scraping_status.get(task_id)
+    if st and st.get('status') == 'running':
+        st['progress'] = min(max(int(percent), 0), 95)  # cap before finalization
+        st['message'] = message
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
